@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "id": "xdna1-mock",
+      "name": "XDNA1 mock (wiring test)",
+      "context_length": 4096,
+      "backend": "mock",
+      "supports_chat": true
+    },
+    {
+      "id": "qwen2.5-0.5b",
+      "name": "Qwen2.5 0.5B Instruct (bf16 CPU + XDNA1 NPU GEMM prefill)",
+      "context_length": 8192,
+      "backend": "xdna1",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "supports_chat": true
+    }
+  ]
+}

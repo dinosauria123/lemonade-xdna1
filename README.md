@@ -43,6 +43,7 @@ $ xrt-smi examine
 | 🎲 **Attention KV-prune** (NPU evicts low-mass keys) | ✅ **4× @ cos 0.976** |
 | 🖼️ **Vision pipeline** (rgba2gray→3×3 conv→threshold) on the NPU | ✅ **PASS** — the NPU's native CNN strength |
 | 🧩 **SigLIP/ViT patch-embed** wired on the NPU | ✅ bit-exact (offload play; ~3.2× slower than CPU at base size — honest) |
+| 🍋 **XDNA1 as a Lemonade backend** — OpenAI shim + 0.5B engine, per-layer GEMMs on the NPU, registered as a Lemonade cloud provider | ✅ **687 GFLOP / ~24.6 GFLOPS** — real text through the router |
 
 ## 😈 Why this exists
 
@@ -79,6 +80,13 @@ python3 examples/npu_ffn_prune.py           # MEASURED FFN net-win + accuracy tr
 python3 examples/npu_attention_prune.py     # MEASURED attention KV-prune (both GEMMs shrink)
 python3 mlir-aie/programming_examples/vision/edge_detect/edge_detect.py -W 512 -H 512  # 2D conv vision pipeline on NPU
 python3 examples/npu_patch_embed.py         # SigLIP/ViT patch-embed on the NPU (measured, honest)
+```
+
+Use the NPU through **Lemonade** (OpenAI-compatible shim + real 0.5B engine with NPU GEMM offload):
+```bash
+bash server/run.sh                            # starts the shim on :8901 (needs the python3.14 shimenv, see server/README.md)
+lemonade cloud install xdna --base-url http://127.0.0.1:8901/v1 --allow-insecure-http --api-key ***
+lemonade run xdna.qwen2.5-0.5b -m "hi"        # NPU does the GEMMs, real text comes back
 ```
 
 ## 🧬 The flex: you can hand-write AIE kernels like AltiVec
