@@ -90,5 +90,8 @@ pads to the 64-row tile, so it is slower than CPU — see
 - `XDNA_OAI_KEY` (optional; enables token auth)
 - `XDNA_OAI_MODELS` (models.json path)
 - `XDNA_NPU_GEMM` (default 1; 0 = CPU-only)
+- `XDNA_NPU_ATTENTION` (default 1; 0 = CPU SDPA attention. NPU path verified
+  A/B against CPU attention — exact greedy match, see
+  `examples/test_engine_attention.py`)
 - `XDNA_NPU_GEMM_PREFILL_ONLY` (default 0; 1 = NPU only for M≥64 GEMMs)
 - `MLIR_AIE_DIR` (default `~/open-xdna/mlir-aie`)

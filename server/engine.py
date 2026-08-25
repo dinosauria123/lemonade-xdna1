@@ -37,6 +37,17 @@ def _offload_enabled():
     return os.environ.get("XDNA_NPU_GEMM", "1") not in ("0", "false", "no")
 
 
+def _npu_attention_enabled():
+    """Route the attention matmuls (QK^T, AV) through the NPU (default ON).
+
+    Verified A/B: with the causal-mask fix (causality from S_q==S_k geometry,
+    not from the cache object), greedy decode matches CPU attention exactly
+    (examples/test_engine_attention.py, EXACT MATCH). Set
+    XDNA_NPU_ATTENTION=0 to fall back to torch SDPA.
+    """
+    return os.environ.get("XDNA_NPU_ATTENTION", "1") in ("1", "true", "yes")
+
+
 def _prefill_only():
     return os.environ.get("XDNA_NPU_GEMM_PREFILL_ONLY", "0") in ("1", "true", "yes")
 
@@ -69,10 +80,83 @@ class XDna1LLM:
                     layer.mlp.down_proj,
                 ):
                     self._wrap_linear(lin)
+            if _npu_attention_enabled():
+                self._install_npu_attention()
 
         # NPU status snapshot (for /health and diagnostics)
         self.npu_available = npu_gemm.available()
         self.npu_error = "" if self.npu_available else npu_gemm.error()
+
+    # -- NPU attention override -------------------------------------------------
+
+    def _install_npu_attention(self):
+        """Replace each layer's SDPA with the NPU attention core.
+
+        The Q/K/V/O projections stay NPU-GEMM-wrapped (see _wrap_linear). We
+        keep transformers' RoPE + KV-cache handling and only swap the
+        scaled-dot-product attention math for npu_gemm.npu_attention_core, which
+        routes the QK^T and AV matmuls through the same NPU kernel.
+        """
+        from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+
+        for layer in self.layers:
+            attn = layer.self_attn
+            attn._npu_forward_orig = attn.forward
+
+            def make_forward(attn):
+                cfg = attn.config
+                n_heads_q = cfg.num_attention_heads
+                n_heads_kv = cfg.num_key_value_heads
+                n_rep = n_heads_q // n_heads_kv
+                head_dim = attn.head_dim
+                scale = attn.scaling
+
+                def forward(hidden_states, position_embeddings, attention_mask,
+                            past_key_values=None, **kwargs):
+                    import torch  # already loaded in __init__
+                    import numpy as np
+                    from ml_dtypes import bfloat16
+                    input_shape = hidden_states.shape[:-1]  # (1, S_q) for batch=1
+                    hidden_shape = (*input_shape, -1, head_dim)
+                    q = attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    k = attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    v = attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+                    cos, sin = position_embeddings
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                    if past_key_values is not None:
+                        k, v = past_key_values.update(k, v, attn.layer_idx)
+                    # batch is 1; to numpy bf16 [n_heads, S, D]
+                    Q = q.detach().to(torch.float32).numpy()[0].astype(bfloat16)
+                    K = k.detach().to(torch.float32).numpy()[0].astype(bfloat16)
+                    V = v.detach().to(torch.float32).numpy()[0].astype(bfloat16)
+                    out_np = npu_gemm.npu_attention_core(
+                        Q, K, V, scale, n_rep,
+                        # Causality from geometry, not from the cache object:
+                        # with use_cache=True the model hands us an (empty)
+                        # DynamicCache even for the prefill, so
+                        # `past_key_values is None` is NOT a reliable prefill
+                        # signal. Prefill: S_q == S_k -> apply causal mask.
+                        # Decode: S_q(=1) < S_k -> query sits at the end, no
+                        # mask needed.
+                        causal=(Q.shape[1] == K.shape[1]))
+                    # npu_attention_core returns [n_heads, S_q, D] (batch sliced off).
+                    # Re-add the (1,) leading dim to match transformers' Qwen2Attention,
+                    # which reshapes attn_output (batch, n_heads, S_q, D) via
+                    # .transpose(1, 2).reshape(batch, S_q, n_heads*D). With the extra
+                    # dim this is: out.view(1, n_heads, S_q, D).transpose(1, 2).reshape
+                    # (*input_shape, -1); the previous .transpose(1, 2) on the raw
+                    # 3-D tensor swapped head<->seq and produced garbage.
+                    out_t = torch.from_numpy(out_np).to(attn.q_proj.weight.dtype)
+                    attn_output = out_t.view(
+                        1, n_heads_q, input_shape[1], head_dim
+                    ).transpose(1, 2).reshape(
+                        *input_shape, -1).contiguous()
+                    attn_output = attn.o_proj(attn_output)
+                    return attn_output, None
+
+                return forward
+
+            attn.forward = make_forward(attn)
 
     # -- NPU GEMM wrapper ----------------------------------------------------
 

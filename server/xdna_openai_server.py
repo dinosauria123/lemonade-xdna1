@@ -73,6 +73,64 @@ def load_models(path):
 
 
 # ---------------------------------------------------------------------------
+# Rolling NPU busy % (duty cycle)
+#
+# The XDNA1 firmware / kernel PMF on this platform (Ryzen 7 8845HS / Hawk
+# Point) does NOT expose an NPU utilization sensor via the amdxdna QUERY_SENSORS
+# ioctl (amd_pmf_get_npu_data -> -ENODEV), so tools like lemond's
+# /system-stats cannot read a hardware NPU %. The shim, however, runs the NPU
+# and already accumulates npu_gemm.stats["run_s"] (wall time spent in NPU GEMM
+# kernels). A rolling duty cycle 100*Δrun_s/Δt over a short window is a genuine
+# measure of NPU busy-ness for the workload that actually uses the silicon here.
+# ---------------------------------------------------------------------------
+
+class NpuBusy:
+    """Rolling NPU duty cycle derived from npu_gemm.stats["run_s"]."""
+
+    def __init__(self, window=1.0, poll=0.2):
+        self.window = float(window)
+        self.poll = float(poll)
+        self._lock = threading.Lock()
+        self._samples = []  # list of (monotonic_t, run_s)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _read_run_s():
+        try:
+            import npu_gemm
+
+            return float(npu_gemm.stats.get("run_s", 0.0))
+        except Exception:
+            return 0.0
+
+    def _poll(self):
+        while not self._stop.is_set():
+            time.sleep(self.poll)
+            with self._lock:
+                self._samples.append((time.perf_counter(), self._read_run_s()))
+                cutoff = time.perf_counter() - self.window * 4
+                while self._samples and self._samples[0][0] < cutoff:
+                    self._samples.pop(0)
+
+    def percent(self):
+        with self._lock:
+            self._samples.append((time.perf_counter(), self._read_run_s()))
+            if len(self._samples) < 2:
+                return 0.0
+            t0, rs0 = self._samples[0]
+            t1, rs1 = self._samples[-1]
+            dt = t1 - t0
+            if dt <= 0:
+                return 0.0
+            return max(0.0, min(100.0, 100.0 * (rs1 - rs0) / dt))
+
+    def stop(self):
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
 # model backends
 #
 # A backend yields text deltas (str) for one generation call. It must not
@@ -307,6 +365,14 @@ class Handler(BaseHTTPRequestHandler):
                     }
             except Exception as e:  # noqa: BLE001
                 resp["npu"] = {"error": f"{type(e).__name__}: {e}"}
+            # Rolling duty cycle: genuine NPU busy % for this platform
+            # (kernel PMF sensor is unavailable on Hawk Point).
+            try:
+                resp["npu"]["npu_busy_percent"] = float(round(
+                    self.server.npu_busy.percent(), 1
+                ))
+            except Exception:
+                pass
             return self._send_json(resp)
         status, obj = error_response(f"unknown path {self.path}", "not_found", 404)
         return self._send_json(obj, 404)
@@ -496,7 +562,30 @@ def main():
     models = load_models(models_path)
     server = ThreadingHTTPServer((host, port), Handler)
     server.models = models
+    server.npu_busy = NpuBusy()
     server.daemon_threads = True
+
+    # Warm up the engine at startup so the NPU JIT-compiles every GEMM/attention
+    # shape ONCE here, before the first real request. Without this, the first
+    # chat request triggers a JIT storm (one compile per novel [M,K,N] shape)
+    # and can take minutes. After warmup, cached kernels make requests fast.
+    if os.environ.get("XDNA_NPU_WARMUP", "1") not in ("0", "false", "no"):
+        try:
+            import engine as _engine_mod
+            print("xdna openai shim: warming up engine (NPU JIT compiles)...")
+            _eng = _engine_mod.get_engine(models[0].get("model") if models else None)
+            # one short dummy generation exercises prefill + decode shapes
+            list(_eng.generate(
+                [{"role": "user", "content": "warmup"}],
+                {"max_tokens": 1, "temperature": 0.0, "top_k": 1},
+            ))
+            print(f"xdna openai shim: warmup done "
+                  f"(jit_compiles={_engine_mod.npu_gemm.stats['compile_calls']}, "
+                  f"npu_attention={'on' if _engine_mod._npu_attention_enabled() else 'off'})")
+        except Exception as e:  # noqa: BLE001 - never block startup on warmup failure
+            print(f"xdna openai shim: warmup skipped: {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
+
     print(f"xdna openai shim: listening on http://{host}:{port}")
     print(f"  models: {[m['id'] + ' (' + m['backend'] + ')' for m in models]}")
     print(f"  auth: {'required (XDNA_OAI_KEY set)' if os.environ.get('XDNA_OAI_KEY') else 'disabled'}")

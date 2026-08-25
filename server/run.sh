@@ -8,7 +8,8 @@
 #
 # Usage:  bash server/run.sh
 # Env overrides: XDNA_OAI_HOST, XDNA_OAI_PORT, XDNA_OAI_KEY, XDNA_OAI_MODELS,
-#                XDNA_NPU_GEMM (default 1), XDNA_NPU_GEMM_PREFILL_ONLY (default 0)
+#                XDNA_NPU_GEMM (default 1), XDNA_NPU_ATTENTION (default 1),
+#                XDNA_NPU_GEMM_PREFILL_ONLY (default 0)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -20,6 +21,7 @@ export XDNA_OAI_HOST="${XDNA_OAI_HOST:-127.0.0.1}"
 export XDNA_OAI_PORT="${XDNA_OAI_PORT:-8901}"
 export XDNA_OAI_MODELS="${XDNA_OAI_MODELS:-${HERE}/models.json}"
 export XDNA_NPU_GEMM="${XDNA_NPU_GEMM:-1}"
+export XDNA_NPU_ATTENTION="${XDNA_NPU_ATTENTION:-1}"
 export XDNA_NPU_GEMM_PREFILL_ONLY="${XDNA_NPU_GEMM_PREFILL_ONLY:-0}"
 
 exec python "${HERE}/xdna_openai_server.py"
