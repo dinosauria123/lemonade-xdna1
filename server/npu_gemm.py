@@ -61,6 +61,7 @@ stats = {
     "compile_calls": 0,  # first (JIT) call per shape
     "run_s": 0.0,        # cumulative kernel+transfer wall time
     "shapes": {},        # (M,K,N) -> count
+    "fused_calls": 0,    # fused-attention dispatches (per KV-head group)
 }
 
 
@@ -215,7 +216,7 @@ def _single_gemm(a, w):
 # O(S) per row and negligible next to the GEMMs, so CPU is fine.
 # ---------------------------------------------------------------------------
 
-def npu_attention_core(Q, K, V, scale, n_rep=1, causal=False):
+def npu_attention_core(Q, K, V, scale, n_rep=1, causal=False, force_cpu=False):
     """NPU attention core with optional GQA repeat-kv.
 
     Q: [n_heads_q, S_q, D] bf16. K, V: [n_heads_kv, S_k, D] bf16 (n_heads_kv
@@ -239,7 +240,7 @@ def npu_attention_core(Q, K, V, scale, n_rep=1, causal=False):
     if n_rep == 1 and nh_kv != nh_q:
         n_rep = nh_q // nh_kv
     out = np.empty((nh_q, S_q, D), dtype=np.float32)
-    use_npu = available()
+    use_npu = available() and not force_cpu
     # Causal mask: query i may attend to key j only if j <= i. For decode
     # (S_q=1) this is a no-op since the single query sees only past keys.
     if causal and S_q > 1:
@@ -367,3 +368,181 @@ def softmax_bf16(x, axis=-1):
 
 
 _attn_warned = False
+
+
+# ---------------------------------------------------------------------------
+# Fused single-dispatch attention (M3 family, mm_attention_llm).
+#
+# One NPU dispatch per KV-head group per <=5-block chunk: the GQA query
+# heads of a group are TIGHT-packed into the query-row dimension on the
+# host (row r -> head r//S_q, pos r%S_q, padded to 64), and QK^T + mask +
+# LUT-softmax + PV all run in-SRAM (mmacc + LUT kernel, see mlir-aie
+# .../ml/attention/mm_attention_llm.py).  The host supplies the additive
+# mask (causal future / padded keys / garbage rows -> -30.0), which removes
+# the CPU softmax round-trips of the per-head path entirely.
+#
+# BD budget: XDNA1 worker-tile BD pools cap a dispatch at 5 64-row blocks
+# (probed: 5 OK, 6 -> aiecc "Allocator exhausted available buffer
+# descriptor IDs").  Longer ranges are chunked (e.g. Qwen2 prefill 7x64 =
+# 448 rows -> 320 + 128 = 2 dispatches).
+# ---------------------------------------------------------------------------
+_FUSED_DIR = os.path.join(MLIR_AIE_DIR, "programming_examples", "ml", "attention")
+_fused_impl_warned = False
+_FUSED_MAX_BLOCKS = int(os.environ.get("XDNA_FUSED_MAX_BLOCKS", "5"))
+
+
+def _fused_kernel_dir_ready():
+    if not os.path.isdir(_FUSED_DIR):
+        return False
+    if _FUSED_DIR not in sys.path:
+        sys.path.insert(0, _FUSED_DIR)
+    return True
+
+
+def npu_attention_fused_impl(Q, K, V, scale, n_rep=1, causal=False):
+    """Fused attention: QK^T (NPU) -> softmax (CPU, exact) -> AV (NPU).
+
+    Same I/O contract as npu_attention_core:
+    Q [n_heads_q, S_q, D] bf16, K/V [n_heads_kv, S_k, D] bf16,
+    returns [n_heads_q, S_q, D] f32.
+
+    The GQA query heads of each KV group are tight-packed into the
+    query-row dimension (row r -> head r//S_q, pos r%S_q, padded to 64) and
+    run through TWO NPU GEMM dispatches (QK^T, then AV) with the softmax on
+    the host.  This keeps the NPU's GEMM parallelism (the expensive part) but
+    moves softmax OFF the integer-LUT kernel, which mis-computes exp() for the
+    large-magnitude negative scores (sv ~ -2600) that real |T| reaches -- the
+    LUT's truncate-OOR policy returns bogus large exp for masked/distant
+    entries, diverging prefill attention (see large_input_attn_test.py and
+    test_kernel_largeT.py: the LUT kernel FAILs at large |T|).  CPU softmax is
+    numerically exact and O(S) per row, so it is free relative to the GEMMs.
+    """
+    from ml_dtypes import bfloat16 as _bf
+
+    if not available():
+        raise RuntimeError(error())
+    if D_check(Q) != 64:
+        raise RuntimeError(f"fused kernel supports D=64 only (got {D_check(Q)})")
+
+    n_hq, S_q, D = Q.shape
+    n_hkv = K.shape[0]
+    S_k = K.shape[1]
+    if n_rep == 1 and n_hkv != n_hq:
+        n_rep = n_hq // n_hkv
+    if D != 64:
+        raise RuntimeError(f"fused kernel supports D=64 only (got {D})")
+
+    Sk_pad = _ceil_pad(S_k)
+    total = n_rep * S_q                  # real rows (tight-packed)
+    Sq = _ceil_pad(total)                # padded to 64-row blocks
+    bf = _bf                            # the class: kernels.mm rejects np.dtype
+
+    out = np.empty((n_hq, S_q, D), dtype=np.float32)
+    # NOTE: do NOT take _lock here -- matmul_bf16() acquires it internally,
+    # and threading.Lock is non-reentrant, so nesting would deadlock.
+    t0 = time.perf_counter()
+    for g in range(n_hkv):
+        # packed query (row r: head r//S_q, pos r%S_q)
+        rs = np.arange(Sq)
+        real = rs < total
+        heads = np.where(real, rs // S_q, 0)
+        poss = np.where(real, rs % S_q, 0)
+        Qs = np.zeros((Sq, D), dtype=np.float32)
+        Qs[real] = Q[g * n_rep + heads[real], poss[real]] * float(scale)
+        # matmul_bf16(a, w) computes a @ w^T.  For QK^T use w = K[g]
+        # (shape (S_k, D)); for AV use w = V[g].T (shape (D, S_k)).
+        # QK^T in fp32 on host -- the overflow residual is the bf16 quant of
+        # QK^T itself (softmax near-tie amplifies it); AV/V[g] stay bf16-NPU,
+        # so with exact QK^T the residual collapses to rel~0.003.
+        # Qs already carries `scale` (line 451).  Keep T as af32 so the
+        # downstream P.astype(bf) / AV path is unaffected.
+        Kf = K[g].astype(np.float32)
+        T = (Qs @ Kf.T)[:Sq, :S_k].astype(np.float32)
+        # causal / padding mask (exact, on CPU) -- sized to T's key axis
+        Sk = T.shape[1]
+        j = np.arange(Sk)[None, :]
+        pos_ok = ((j <= poss[:, None]) if (causal and S_q > 1)
+                  else np.ones((Sq, Sk), dtype=bool))
+        allowed = real[:, None] & (j < S_k) & pos_ok
+        T = np.where(allowed, T, -np.inf)
+        # softmax on CPU (exact, overflow-safe)
+        z = T - np.nanmax(T, axis=1, keepdims=True)
+        P = np.exp(z)
+        P = np.nan_to_num(P)
+        P /= P.sum(axis=1, keepdims=True)
+        # AV on NPU: P (Sq, S_k) @ V[g].T (D, S_k)^T -> (Sq, D)
+        O = matmul_bf16(P.astype(bf), V[g].T.copy().astype(bf))[:Sq, :D]
+        O = O.astype(np.float32)
+        # unpack tight-packed rows back to (head, pos)
+        rsl = rs
+        reall = real
+        oh = g * n_rep + heads[reall]
+        out[oh, poss[reall]] = O[rsl[reall]]
+    stats["run_s"] += time.perf_counter() - t0
+    stats["fused_calls"] += 1
+    return out
+
+
+def D_check(Q):
+    return Q.shape[2]
+
+
+def npu_attention(Q, K, V, scale, n_rep=1, causal=False):
+    """Decoder attention core dispatcher (drop-in for the engine wrapper).
+
+    impl = XDNA_NPU_ATTENTION_IMPL (default "fused"):
+      fused   -- single-dispatch mmacc attention (fastest); falls back to
+                 per-head on any failure (one warning, then silent)
+      perhead -- per-head matmul_bf16 GEMMs + CPU softmax (A/B exact-verified)
+      cpu     -- pure numpy reference
+    Never raises: worst case returns the CPU result.
+    """
+    impl = os.environ.get("XDNA_NPU_ATTENTION_IMPL", "fused")
+    if impl == "fused":
+        try:
+            return npu_attention_fused_impl(Q, K, V, scale, n_rep, causal)
+        except Exception as e:
+            global _fused_impl_warned
+            if not _fused_impl_warned:
+                _fused_impl_warned = True
+                print(f"[npu_gemm] fused attention unavailable "
+                      f"({type(e).__name__}: {e}); using per-head",
+                      file=sys.stderr, flush=True)
+    if impl == "cpu":
+        return npu_attention_core(Q, K, V, scale, n_rep, causal,
+                                  force_cpu=True)
+    return npu_attention_core(Q, K, V, scale, n_rep, causal)
+
+
+def warmup_fused_shapes(n_rep=7, D=64):
+    """Pre-JIT the fused-attention signatures the model will actually use.
+
+    The dispatch signature is (chunk_rows, Sk_pad, D).  Representative dummy
+    calls (decode S_q=1, prefill S_q=41 and S_q=64, short/long context)
+    compile: (64,64,64), (64,128,64), (320,64,64), (320,128,64), (128,64,64).
+    Other (chunk, Sk) combos JIT lazily (~3s) on first use.
+    Returns the number of distinct signatures compiled.
+    """
+    if not (available() and _fused_kernel_dir_ready()):
+        return 0
+    compiled = 0
+    rng = np.random.default_rng(7)
+    from ml_dtypes import bfloat16 as bf
+    cases = [
+        (1, 64),    # decode, short context   -> (64, 64, 64)
+        (1, 100),   # decode, long context    -> (64, 128, 64)
+        (41, 64),   # Qwen2 prefill S_q=41    -> (320, 64, 64)
+        (41, 100),  # prefill, long context   -> (320, 128, 64)
+        (64, 64),   # prefill S_q=64 (448 rows) -> 320 + 128 chunks
+    ]
+    for S_q, S_k in cases:
+        try:
+            Q = rng.standard_normal((n_rep, S_q, D)).astype(bf)
+            K = rng.standard_normal((1, S_k, D)).astype(bf)
+            V = rng.standard_normal((1, S_k, D)).astype(bf)
+            npu_attention_fused_impl(Q, K, V, 1.0 / 8.0, n_rep, causal=False)
+            compiled += 1
+        except Exception:
+            pass
+    return compiled
+
