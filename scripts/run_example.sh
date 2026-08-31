@@ -9,7 +9,7 @@
 #
 # NOTE: deliberately does NOT use `set -e` — sourcing XRT/IRON env scripts can return
 # nonzero and would silently abort the run under `set -e`.
-MLIR_AIE_DIR="${MLIR_AIE_DIR:-$HOME/open-xdna/mlir-aie}"
+MLIR_AIE_DIR="${MLIR_AIE_DIR:-/home/dino/open-xdna/mlir-aie}"
 LLVM_BIN="${LLVM_BIN:-/usr/lib/llvm-20/bin}"   # provides llvm-objcopy (IRON needs it on PATH)
 XRT_SETUP="${XRT_SETUP:-/opt/xilinx/xrt/setup.sh}"
 EX="${1:?usage: run_example.sh <path under mlir-aie/programming_examples/>}"

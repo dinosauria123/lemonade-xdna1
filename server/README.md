@@ -91,7 +91,19 @@ pads to the 64-row tile, so it is slower than CPU — see
 - `XDNA_OAI_MODELS` (models.json path)
 - `XDNA_NPU_GEMM` (default 1; 0 = CPU-only)
 - `XDNA_NPU_ATTENTION` (default 1; 0 = CPU SDPA attention. NPU path verified
-  A/B against CPU attention — exact greedy match, see
-  `examples/test_engine_attention.py`)
+  A/B against CPU attention, see `examples/test_engine_attention.py`)
+- `XDNA_NPU_ATTENTION_IMPL` (default `fused`; the NPU attention backend):
+  - `fused`   -- M3 single-dispatch mmacc kernel
+    (`mlir-aie/programming_examples/ml/attention/mm_attention_llm.py`):
+    QK^T + mask + LUT-softmax + PV fused into one NPU dispatch per KV-head
+    group (GQA query heads stacked on the host). ~40ms/step for decode vs
+    ~12s for `perhead`. Unit-verified vs a numpy reference (cos 0.99998);
+    falls back to `perhead` on any failure.
+  - `perhead` -- per-head `matmul_bf16` GEMMs + CPU softmax
+    (A/B exact-greedy-verified baseline, dispatch-bound: ~12s/step)
+  - `cpu`     -- pure numpy reference
+- `XDNA_FUSED_MAX_BLOCKS` (default 5; max 64-row blocks per fused dispatch.
+  XDNA1 worker-tile BD pool: 5 OK, 6 exhausts. Longer query ranges are
+  chunked automatically)
 - `XDNA_NPU_GEMM_PREFILL_ONLY` (default 0; 1 = NPU only for M≥64 GEMMs)
 - `MLIR_AIE_DIR` (default `~/open-xdna/mlir-aie`)

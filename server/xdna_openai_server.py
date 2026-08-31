@@ -574,6 +574,19 @@ def main():
             import engine as _engine_mod
             print("xdna openai shim: warming up engine (NPU JIT compiles)...")
             _eng = _engine_mod.get_engine(models[0].get("model") if models else None)
+            # Pre-JIT the fused-attention signature for contexts up to 128 keys
+            # (the dummy generation below covers the <=64-keys one).
+            try:
+                _cfg = getattr(_eng, "config", None)
+                _n_rep = (int(_cfg.num_attention_heads) //
+                          int(_cfg.num_key_value_heads)) if _cfg else 7
+                _nf = _engine_mod.npu_gemm.warmup_fused_shapes(n_rep=_n_rep)
+                if _nf:
+                    print(f"xdna openai shim: fused-attention JIT warmup: "
+                          f"{_nf} signature(s)")
+            except Exception as e:  # noqa: BLE001 - optional pre-warm
+                print(f"xdna openai shim: fused-attention JIT warmup skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
             # one short dummy generation exercises prefill + decode shapes
             list(_eng.generate(
                 [{"role": "user", "content": "warmup"}],

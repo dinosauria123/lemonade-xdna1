@@ -10,7 +10,7 @@
 # Python 3.13 is supported by the wheels per the mlir-aie README.
 #
 set -euo pipefail
-cd ~/open-xdna
+cd /home/dino/open-xdna
 
 echo "==> [1/6] Clone mlir-aie (IRON framework + programming examples)"
 if [ ! -d mlir-aie/.git ]; then
@@ -19,7 +19,7 @@ else
   echo "    already cloned; pulling latest"
   git -C mlir-aie pull --ff-only || true
 fi
-cd mlir-aie
+cd /root/mlir-aie
 echo "    mlir-aie commit: $(git rev-parse --short HEAD)"
 
 echo "==> [2/6] Create Python 3.13 venv (ironenv)"

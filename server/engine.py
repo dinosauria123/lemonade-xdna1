@@ -38,14 +38,21 @@ def _offload_enabled():
 
 
 def _npu_attention_enabled():
-    """Route the attention matmuls (QK^T, AV) through the NPU (default ON).
+    """Route the attention matmuls (QK^T, AV) through the NPU (default OFF).
 
-    Verified A/B: with the causal-mask fix (causality from S_q==S_k geometry,
-    not from the cache object), greedy decode matches CPU attention exactly
-    (examples/test_engine_attention.py, EXACT MATCH). Set
-    XDNA_NPU_ATTENTION=0 to fall back to torch SDPA.
+    The FUSED single-dispatch kernel (impl=fused, default) DIVERGES on the real
+    Qwen2.5-0.5B model — decisive_test.py (2026-08-27): real Q/K/V
+    (n_rep=7, S_k=64) give recorded NPU output off by rel dmax 0.2-3.9 across
+    ALL 24 layers vs torch SDPA, and greedy decode is wrong ("Yes. 1." vs "4").
+    This is a WRAPPER packing/mask bug in npu_attention_fused_impl, NOT the
+    LUT/exp kernel (correct on small synthetic inputs — the "LUT negative-input"
+    hypothesis was already refuted by the isolated unit test and MUST NOT be
+    re-asserted). A n_rep=3 synthetic (test_fused_3way) passed only by chance.
+
+    perhead (impl=perhead) is A/B exact-verified. Set XDNA_NPU_ATTENTION=1 to
+    enable the perhead NPU path explicitly; the default returns torch SDPA.
     """
-    return os.environ.get("XDNA_NPU_ATTENTION", "1") in ("1", "true", "yes")
+    return os.environ.get("XDNA_NPU_ATTENTION", "0") in ("1", "true", "yes")
 
 
 def _prefill_only():
@@ -129,7 +136,7 @@ class XDna1LLM:
                     Q = q.detach().to(torch.float32).numpy()[0].astype(bfloat16)
                     K = k.detach().to(torch.float32).numpy()[0].astype(bfloat16)
                     V = v.detach().to(torch.float32).numpy()[0].astype(bfloat16)
-                    out_np = npu_gemm.npu_attention_core(
+                    out_np = npu_gemm.npu_attention(
                         Q, K, V, scale, n_rep,
                         # Causality from geometry, not from the cache object:
                         # with use_cache=True the model hands us an (empty)
@@ -139,7 +146,7 @@ class XDna1LLM:
                         # Decode: S_q(=1) < S_k -> query sits at the end, no
                         # mask needed.
                         causal=(Q.shape[1] == K.shape[1]))
-                    # npu_attention_core returns [n_heads, S_q, D] (batch sliced off).
+                    # npu_attention returns [n_heads, S_q, D] (batch sliced off).
                     # Re-add the (1,) leading dim to match transformers' Qwen2Attention,
                     # which reshapes attn_output (batch, n_heads, S_q, D) via
                     # .transpose(1, 2).reshape(batch, S_q, n_heads*D). With the extra
