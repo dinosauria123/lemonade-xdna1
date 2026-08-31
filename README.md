@@ -17,6 +17,12 @@
 
 ---
 
+## Fork
+
+`open-xdna` is a fork of [**Scottcjn/open-xdna**](https://github.com/Scottcjn/open-xdna).
+
+---
+
 > **FastFlowLM** and **AMD Lemonade** — the stacks everyone points to for "LLMs on the Ryzen AI NPU" — support **XDNA2 only**. If you own a **Ryzen 7040 / 8040** laptop, AMD's answer for your NPU on Linux is *"not available — use the GPU."*
 >
 > **`open-xdna` is the answer that says "here's how."**
@@ -88,6 +94,25 @@ bash server/run.sh                            # starts the shim on :8901 (needs 
 lemonade cloud install xdna --base-url http://127.0.0.1:8901/v1 --allow-insecure-http --api-key ***
 lemonade run xdna.qwen2.5-0.5b -m "hi"        # NPU does the GEMMs, real text comes back
 ```
+
+## ⚡ Performance: for LLM decode the NPU is ~250× slower than the CPU
+
+On a real Ryzen AI 9 (XDNA1, 5700U), decoding Qwen2.5-0.5B:
+
+| Config | Env | Decode |
+|:-------|:----|:-------|
+| **CPU only** | `XDNA_NPU_GEMM=0` | **~35 tok/s** ← fastest on this box |
+| NPU GEMM (default) | — | ~0.14 tok/s (**~250× slower**) |
+| NPU GEMM + NPU attention | `XDNA_NPU_ATTENTION=1` | ~0 tok/s (unusable, 26 s for 0 tokens) |
+| NPU prefill only | `XDNA_NPU_GEMM_PREFILL_ONLY=1` | 11–21 tok/s (still slower than CPU) |
+
+**Root cause:** each XDNA1 NPU run has ~50 ms of XRT/DRM dispatch overhead, while a
+decode GEMM (M=1 matvec) is only µs — so the overhead wins by four orders of magnitude.
+The NPU pays off at **large M** (long prefill / batching) or CNN/vision work, not single-token text decode.
+
+**Recommendation:** run the shim with `XDNA_NPU_GEMM=0` for LLM decode on this box.
+Keep the NPU for CNN/vision or large-M GEMMs. (`XDNA_NPU_ATTENTION_IMPL=fused` is
+disabled by default — it diverges on the real model; see [`RUN_NPU.md`](RUN_NPU.md)).
 
 ## 🧬 The flex: you can hand-write AIE kernels like AltiVec
 
