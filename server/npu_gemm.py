@@ -50,6 +50,10 @@ _SC_DIR = os.path.join(
     MLIR_AIE_DIR, "programming_examples/basic/matrix_multiplication/single_core"
 )
 
+# XRT-for-XDNA runtime install location (installed alongside libxrt_driver_xdna.so;
+# XILINX_XRT is normally exported by XRT setup.sh, but we also resolve it directly
+# so `pyxrt` is importable and its libs loadable even when setup.sh wasn't sourced).
+_XRT_DIR = os.environ.get("XILINX_XRT", "/opt/xilinx/xrt")
 _lock = threading.Lock()
 _initialized = False
 _available = False
@@ -71,12 +75,29 @@ def _init():
     if _initialized:
         return _available
     _initialized = True
+    # XRT-for-XDNA runtime (libxrt_driver_xdna.so + pyxrt) is installed under
+    # XILINX_XRT (default /opt/xilinx/xrt). setup.sh would normally export this
+    # on PYTHONPATH/LD_LIBRARY_PATH, but callers of this shim don't have to
+    # source it: make `import pyxrt` and its native libs resolvable directly.
+    if os.path.isdir(os.path.join(_XRT_DIR, "python")):
+        sys.path.insert(0, os.path.join(_XRT_DIR, "python"))
+        if os.path.isdir(os.path.join(_XRT_DIR, "lib")):
+            _old_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = (
+                _XRT_DIR + "/lib" + (":" + _old_ld if _old_ld else "")
+            )
+    # IRON selects the runtime backend from IRON_RUNTIME_TYPE. "llvm" is the
+    # host-runtime backend that binds the XRT-for-XDNA runtime (RyzenAI-npu1)
+    # via /dev/accel/accel0; without it, iron.tensor(device="npu") is refused
+    # with "Unsupported device". This is required on the Ryzen AI box that has
+    # no XILINX_XRT/XRT for Alveo devices.
+    os.environ.setdefault("IRON_RUNTIME_TYPE", "llvm")
     try:
         if not os.path.isdir(_SC_DIR):
             _error = f"single_core kernel dir not found: {_SC_DIR}"
             return False
         sys.path.insert(0, _SC_DIR)
-        import pyxrt  # noqa: F401  (fails if XRT env is not set up)
+        import pyxrt  # noqa: F401  (needs XRT env set up just above)
         # new pyxrt: enumerate_devices() returns a count (int);
         # old pyxrt returned a list of device objects.
         n_dev = pyxrt.enumerate_devices()
@@ -85,6 +106,15 @@ def _init():
         if n_dev == 0:
             _error = "pyxrt imported but 0 NPU devices visible (driver/firmware?)"
             return False
+        # IMPORTANT: aie.utils has already frozen DEFAULT_TENSOR_CLASS to the
+        # CPU-only CPUOnlyTensor at its import time (has_xrt was False then, so
+        # no pyxrt was importable). With pyxrt now importable the XRT-backed
+        # XRTTensor must take over or iron.tensor(device="npu") below is refused
+        # with "Unsupported device". Reloading aie.utils recomputes has_xrt=True
+        # without recreating the already-imported aie.iron (cached in sys.modules).
+        import importlib as _il
+        import aie.utils as _aieutils
+        _il.reload(_aieutils)
         from single_core import single_core  # noqa: F401  (import test only)
         import aie.iron  # noqa: F401
         _available = True
